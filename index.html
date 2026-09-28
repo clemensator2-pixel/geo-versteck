@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Geo-Versteck (echte Karte)</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<style>
+:root{ --accent:#2563eb; --danger:#dc2626; --safe:#16a34a; --bg:#f5f6f8; --card:#fff; --text:#1b1e24; --muted:#6b7280; --border:#e2e4e9; }
+*{box-sizing:border-box;}
+html,body{height:100%; margin:0; font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text);}
+#start{padding:16px; padding-top:calc(16px + env(safe-area-inset-top,0px));}
+h1{font-size:1.15rem; margin:0 0 4px;}
+p.sub{color:var(--muted); font-size:.85rem; margin:0 0 14px;}
+.card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:12px;}
+label{display:block; font-size:.8rem; color:var(--muted); margin:10px 0 4px;}
+input[type=text]{width:100%; padding:9px 10px; border-radius:9px; border:1px solid var(--border); font-size:1rem;}
+.row{display:flex; gap:8px;}
+.row>*{flex:1;}
+button{border:none; border-radius:10px; padding:11px 14px; font-size:.95rem; font-weight:600; cursor:pointer;}
+button.primary{background:var(--accent); color:#fff; width:100%;}
+button.ghost{background:transparent; color:var(--accent); border:1px solid var(--accent);}
+button:disabled{opacity:.45;}
+small.note{color:var(--muted); font-size:.72rem; display:block; margin-top:8px;}
+#map{position:fixed; inset:0; display:none;}
+#hud{position:fixed; top:env(safe-area-inset-top,0px); left:0; right:0; padding:10px; z-index:1000; display:none; pointer-events:none;}
+#hud .card{pointer-events:auto; padding:10px 12px; font-size:.82rem;}
+.banner{padding:8px 10px; border-radius:9px; font-weight:600; font-size:.82rem; margin-bottom:6px;}
+.banner.danger{background:#fee2e2; color:#991b1b;}
+.banner.safe{background:#dcfce7; color:#166534;}
+#bottomPanel{position:fixed; left:0; right:0; bottom:env(safe-area-inset-bottom,0px); z-index:1000; display:none; padding:10px;}
+#bottomPanel .card{pointer-events:auto; max-height:38vh; overflow-y:auto;}
+.zone-row{display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid var(--border); font-size:.85rem;}
+.zone-row:last-child{border-bottom:none;}
+#drawBar{position:fixed; left:0; right:0; bottom:env(safe-area-inset-bottom,0px); z-index:1001; display:none; padding:10px;}
+#drawBar .card{pointer-events:auto;}
+.hidden{display:none !important;}
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>🕵️ Geo-Versteck</h1>
+  <p class="sub">Echte OpenStreetMap-Karte, echtes Zoomen, echtes GPS.</p>
+  <div class="card">
+    <label>Dein Name</label>
+    <input type="text" id="inName" placeholder="Dein Name">
+    <label>Rolle</label>
+    <div class="row">
+      <button class="ghost" id="btnRoleSucher">Sucher</button>
+      <button class="ghost" id="btnRoleVersteck">Versteckt</button>
+    </div>
+    <label>Spielcode (Beitreten) – oder vorhandene Bucket-ID</label>
+    <input type="text" id="inCode" placeholder="Code vom Ersteller">
+    <label>E-Mail (nur beim Erstellen eines neuen Spiels, geht an kvdb.io)</label>
+    <input type="text" id="inEmail" placeholder="name@beispiel.de">
+    <div class="row" style="margin-top:12px">
+      <button class="ghost" onclick="createGame()">Neues Spiel erstellen</button>
+      <button class="primary" onclick="joinGame()">Beitreten</button>
+    </div>
+    <small class="note">Nutzt <a href="https://kvdb.io" target="_blank">kvdb.io</a> als kostenlosen, anmeldefreien Zwischenspeicher für den gemeinsamen Spielstand – kein eigener Server nötig, aber auch keine Garantie für Verfügbarkeit. Karte: © OpenStreetMap-Mitwirkende.</small>
+  </div>
+</div>
+
+<div id="map"></div>
+<div id="hud">
+  <div class="card">
+    <div id="banners"></div>
+    <div id="gpsLine" style="color:var(--muted)">GPS: —</div>
+    <div id="peerLine" style="color:var(--muted); margin-top:2px;"></div>
+  </div>
+</div>
+<div id="drawBar">
+  <div class="card">
+    <p id="drawHint" style="margin:0 0 8px;font-size:.85rem;"></p>
+    <div class="row">
+      <button class="ghost" onclick="undoPoint()">Zurück</button>
+      <button class="primary" onclick="finishShape()">Fertig</button>
+    </div>
+    <button class="primary hidden" id="btnStartGame" style="margin-top:8px" onclick="pushInitialState()">Spiel starten</button>
+  </div>
+</div>
+<div id="bottomPanel">
+  <div class="card">
+    <div class="row" style="margin-bottom:8px;">
+      <button class="ghost" onclick="startDrawBoundary()">Gebiet neu zeichnen</button>
+    </div>
+    <strong style="font-size:.85rem;">Zonen</strong>
+    <div id="zoneList"></div>
+  </div>
+</div>
+
+<script>
+const KVDB_BASE='https://kvdb.io';
+const LOCK_COOLDOWN=10*60*1000;
+let state={name:'',role:null,code:null,map:null,myLayer:null,peerLayers:{},boundaryLayer:null,zoneLayers:{},
+  mode:null,points:[],previewLayer:null,boundary:null,zones:[],myLocks:[],lat:null,lng:null,acc:null,peers:{}};
+
+document.getElementById('btnRoleSucher').onclick=()=>setRole('sucher');
+document.getElementById('btnRoleVersteck').onclick=()=>setRole('versteck');
+function setRole(r){ state.role=r;
+  document.getElementById('btnRoleSucher').style.background=r==='sucher'?'var(--accent)':'transparent';
+  document.getElementById('btnRoleSucher').style.color=r==='sucher'?'#fff':'var(--accent)';
+  document.getElementById('btnRoleVersteck').style.background=r==='versteck'?'var(--accent)':'transparent';
+  document.getElementById('btnRoleVersteck').style.color=r==='versteck'?'#fff':'var(--accent)'; }
+
+function randomCode(){ return Math.random().toString(36).slice(2,8); }
+
+async function kvGet(){ try{ const res=await fetch(`${KVDB_BASE}/${state.code}/state`); if(!res.ok) return null; return await res.json(); }catch(e){ console.error(e); return null; } }
+async function kvPut(obj){ try{ const res=await fetch(`${KVDB_BASE}/${state.code}/state`, {method:'PUT', body:JSON.stringify(obj)}); return res.ok; }catch(e){ console.error(e); return false; } }
+
+async function createGame(){
+  if(!validateStart()) return;
+  const email=document.getElementById('inEmail').value.trim();
+  const existing=document.getElementById('inCode').value.trim();
+  try{
+    if(existing){ state.code=existing; }
+    else{
+      if(!email||!email.includes('@')){ alert('Zum Erstellen braucht kvdb.io einmalig eine E-Mail-Adresse (oder trage unten eine vorhandene Bucket-ID als Spielcode ein).'); return; }
+      const res=await fetch(KVDB_BASE+'/', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'email='+encodeURIComponent(email)});
+      if(!res.ok){ alert('kvdb.io hat das Erstellen abgelehnt (Status '+res.status+').'); return; }
+      state.code=(await res.text()).trim();
+    }
+  }catch(e){ alert('Verbindung zu kvdb.io fehlgeschlagen: '+e.message+'\n\nTipp: Die Seite muss über HTTPS (z.B. GitHub Pages/Netlify) laufen, und kvdb.io darf nicht durch ein Netzwerk/Schulfilter blockiert sein.'); return; }
+  const ok=await kvPut({boundary:null, zones:[], players:{}});
+  if(!ok){ alert('Spielstand konnte nicht gespeichert werden – Bucket-ID/Verbindung prüfen.'); return; }
+  alert('Spielcode: '+state.code+'\n\nGib diesen Code an deine Freunde weiter, damit sie beitreten können.');
+  enterMap();
+}
+async function joinGame(){
+  if(!validateStart()) return;
+  const c=document.getElementById('inCode').value.trim();
+  if(!c){ alert('Bitte Spielcode eingeben (oder "Neues Spiel erstellen" nutzen).'); return; }
+  state.code=c;
+  const s=await kvGet();
+  if(s===null){ alert('Spielcode nicht gefunden.'); return; }
+  state.boundary=s.boundary; state.zones=s.zones||[];
+  enterMap();
+}
+function validateStart(){
+  state.name=document.getElementById('inName').value.trim()||'Spieler';
+  if(!state.role){ alert('Bitte Rolle auswählen.'); return false; }
+  return true;
+}
+
+function enterMap(){
+  document.getElementById('start').style.display='none';
+  document.getElementById('map').style.display='block';
+  document.getElementById('hud').style.display='block';
+  document.getElementById('bottomPanel').style.display='block';
+  state.map=L.map('map').setView([51.8309,7.2783], 16);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap-Mitwirkende', maxZoom:19}).addTo(state.map);
+  startGeolocation();
+  redrawZones();
+  if(!state.boundary){ startDrawBoundary(); } else { pollLoop(); }
+}
+
+// ---- Zeichnen ----
+function startDrawBoundary(){
+  state.mode='boundary'; state.points=[]; state.zones= state.zones||[]; if(!state.boundary) state.boundary=null;
+  document.getElementById('drawBar').style.display='block';
+  document.getElementById('btnStartGame').classList.add('hidden');
+  updateDrawHint();
+  state.map.off('click'); state.map.on('click', onMapClickDraw);
+}
+function updateDrawHint(){
+  document.getElementById('drawHint').textContent = state.mode==='boundary'
+    ? 'Tippe Eckpunkte entlang der Außengrenze des Spielgebiets an, dann "Fertig".'
+    : 'Tippe Eckpunkte für eine Unterzone an, dann "Fertig". Danach "Spiel starten".';
+}
+function onMapClickDraw(e){ state.points.push(e.latlng); drawPreview(); }
+function undoPoint(){ state.points.pop(); drawPreview(); }
+function drawPreview(){
+  if(state.previewLayer) state.map.removeLayer(state.previewLayer);
+  if(state.points.length) state.previewLayer=L.polygon(state.points, {color: state.mode==='zone'?'#dc2626':'#2563eb'}).addTo(state.map);
+}
+function finishShape(){
+  if(state.points.length<3){ alert('Mindestens 3 Punkte nötig.'); return; }
+  if(state.mode==='boundary'){
+    state.boundary=state.points.map(p=>[p.lat,p.lng]); state.points=[]; state.mode='zone';
+    document.getElementById('btnStartGame').classList.remove('hidden'); updateDrawHint();
+  } else {
+    const name=prompt('Name der Zone:','Zone '+(state.zones.length+1))||('Zone '+(state.zones.length+1));
+    state.zones.push({id:'z'+Date.now(), name, points:state.points.map(p=>[p.lat,p.lng])}); state.points=[];
+  }
+  if(state.previewLayer){ state.map.removeLayer(state.previewLayer); state.previewLayer=null; }
+  redrawZones();
+}
+async function pushInitialState(){
+  await kvPut({boundary:state.boundary, zones:state.zones, players:{}});
+  document.getElementById('drawBar').style.display='none';
+  state.map.off('click'); state.mode=null;
+  pollLoop();
+}
+function redrawZones(){
+  if(state.boundaryLayer) state.map.removeLayer(state.boundaryLayer);
+  if(state.boundary) state.boundaryLayer=L.polygon(state.boundary,{color:'#2563eb',fillOpacity:.05}).addTo(state.map);
+  Object.values(state.zoneLayers).forEach(l=>state.map.removeLayer(l)); state.zoneLayers={};
+  (state.zones||[]).forEach(z=>{ state.zoneLayers[z.id]=L.polygon(z.points,{color:'#16a34a',fillOpacity:.15}).bindTooltip(z.name).addTo(state.map); });
+  renderZoneList();
+}
+
+// ---- GPS ----
+function startGeolocation(){
+  if(!navigator.geolocation){ document.getElementById('gpsLine').textContent='GPS: von diesem Browser nicht unterstützt.'; return; }
+  navigator.geolocation.watchPosition(pos=>{
+    state.lat=pos.coords.latitude; state.lng=pos.coords.longitude; state.acc=pos.coords.accuracy;
+    document.getElementById('gpsLine').textContent=`GPS: ${state.lat.toFixed(5)}, ${state.lng.toFixed(5)} (±${Math.round(state.acc)}m)`;
+    if(!state.myLayer){ state.myLayer=L.circleMarker([state.lat,state.lng],{radius:8,color:'#fff',weight:2,fillColor:state.role==='sucher'?'#dc2626':'#2563eb',fillOpacity:1}).addTo(state.map); state.map.setView([state.lat,state.lng],17); }
+    else { state.myLayer.setLatLng([state.lat,state.lng]); }
+    checkStatus(); pushMyState();
+  }, err=>{ document.getElementById('gpsLine').textContent='GPS: ❌ '+err.message; }, {enableHighAccuracy:true, maximumAge:4000});
+}
+
+function pointInPoly(lat,lng,poly){
+  let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const yi=poly[i][0], xi=poly[i][1], yj=poly[j][0], xj=poly[j][1];
+    const intersect=((yi>lat)!==(yj>lat)) && (lng < (xj-xi)*(lat-yi)/(yj-yi)+xi);
+    if(intersect) inside=!inside;
+  }
+  return inside;
+}
+function combinedLocks(){
+  const set=new Set();
+  const all=Object.assign({}, state.peers, {__self:{role:state.role, myLocks:state.myLocks}});
+  Object.values(all).forEach(p=>{ if(p.role==='sucher' && p.myLocks) p.myLocks.forEach(l=>set.add(l.zoneId)); });
+  return set;
+}
+function myLastLockAt(){ return state.myLocks.length? state.myLocks[state.myLocks.length-1].lockedAt : 0; }
+async function lockZone(id){
+  const remaining=LOCK_COOLDOWN-(Date.now()-myLastLockAt());
+  if(remaining>0){ alert('Noch '+Math.ceil(remaining/60000)+' Min. bis zur nächsten Sperre.'); return; }
+  state.myLocks.push({zoneId:id, lockedAt:Date.now()});
+  await pushMyState(); renderZoneList(); checkStatus();
+}
+function checkStatus(){
+  if(state.lat==null||!state.boundary) return;
+  const locks=combinedLocks();
+  const banners=document.getElementById('banners'); banners.innerHTML='';
+  const inBoundary=pointInPoly(state.lat,state.lng,state.boundary);
+  if(!inBoundary){ banners.innerHTML='<div class="banner danger">⚠️ Du bist außerhalb des Spielgebiets!</div>'; }
+  else{
+    const inLocked=(state.zones||[]).some(z=>locks.has(z.id)&&pointInPoly(state.lat,state.lng,z.points));
+    banners.innerHTML = inLocked ? '<div class="banner danger">🔒 Du bist in einer gesperrten Zone!</div>' : '<div class="banner safe">✅ Du bist im erlaubten Bereich.</div>';
+  }
+  Object.values(state.zoneLayers).forEach((layer,i)=>{});
+  (state.zones||[]).forEach(z=>{ const l=state.zoneLayers[z.id]; if(l) l.setStyle({color: locks.has(z.id)?'#dc2626':'#16a34a', fillOpacity: locks.has(z.id)?.28:.15}); });
+}
+function renderZoneList(){
+  const locks=combinedLocks();
+  const zl=document.getElementById('zoneList'); zl.innerHTML='';
+  (state.zones||[]).forEach(z=>{
+    const locked=locks.has(z.id);
+    const row=document.createElement('div'); row.className='zone-row';
+    const remaining=LOCK_COOLDOWN-(Date.now()-myLastLockAt());
+    let btn='';
+    if(state.role==='sucher' && !locked){ const dis=remaining>0; btn=`<button ${dis?'disabled':''} onclick="lockZone('${z.id}')">${dis?Math.ceil(remaining/60000)+' Min':'Sperren'}</button>`; }
+    row.innerHTML=`<span>${z.name}${locked?' 🔒':''}</span>${btn}`; zl.appendChild(row);
+  });
+}
+
+// ---- Sync ----
+async function pushMyState(){
+  if(!state.code||state.lat==null) return;
+  const s=await kvGet(); if(!s) return;
+  s.players=s.players||{}; s.players[state.name]={role:state.role, lat:state.lat, lng:state.lng, acc:state.acc, myLocks:state.myLocks};
+  if(state.boundary && !s.boundary){ s.boundary=state.boundary; s.zones=state.zones; }
+  await kvPut(s);
+}
+async function pollLoop(){
+  const s=await kvGet();
+  if(s){
+    if(s.boundary && JSON.stringify(s.boundary)!==JSON.stringify(state.boundary)){ state.boundary=s.boundary; state.zones=s.zones||[]; redrawZones(); }
+    state.peers=Object.fromEntries(Object.entries(s.players||{}).filter(([n])=>n!==state.name));
+    Object.entries(state.peers).forEach(([name,p])=>{
+      if(p.lat==null) return;
+      if(!state.peerLayers[name]) state.peerLayers[name]=L.circleMarker([p.lat,p.lng],{radius:6,color:'#fff',weight:2,fillColor:p.role==='sucher'?'#dc2626':'#2563eb',fillOpacity:1}).bindTooltip(name).addTo(state.map);
+      else state.peerLayers[name].setLatLng([p.lat,p.lng]);
+    });
+    document.getElementById('peerLine').textContent='Mitspieler: '+(Object.keys(state.peers).length? Object.entries(state.peers).map(([n,p])=>`${n} (${p.role==='sucher'?'Sucher':'Versteckt'})`).join(', ') : 'nur du bisher');
+    checkStatus(); renderZoneList();
+  }
+  setTimeout(pollLoop, 4000);
+}
+</script>
+</body>
+</html>
